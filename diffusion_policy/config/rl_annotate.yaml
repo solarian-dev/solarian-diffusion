@@ -1,0 +1,265 @@
+# Configuration for offline VLM-based reward annotation of UMI datasets.
+#
+# Used by `scripts/annotate_rewards_vlm.py`. The annotator clones the
+# source `.zarr.zip`, extracts per-episode strided keyframes (with the
+# tracked bbox overlaid on the first frame so the VLM knows the target),
+# asks the VLM for an outcome label and the index of the first frame
+# where that outcome is unambiguous, and writes the result into the
+# cloned dataset under `rl/`.
+
+vlm:
+  base_url: http://10.0.0.159:8000/v1
+  api_key: local
+  # Qwen2.5-VL-7B-Instruct: solid multi-image understanding, follows
+  # structured JSON output reliably, accepts many images per prompt
+  # natively. Strong default for offline annotation. (Alternatives:
+  # Qwen2.5-VL-72B-Instruct for higher accuracy at much higher cost,
+  # GPT-4o / o3 if you have API access, GLM-4V-9B as a smaller open
+  # alternative.)
+  model: Qwen/Qwen2.5-VL-7B-Instruct
+  temperature: 0.0
+  timeout_s: 60.0
+  # Budget for reasoning + JSON together. The system prompt now asks
+  # for a per-cell evidence walk-through, which means a 12-cell clip
+  # produces ~12 short tags + the conclusion + the JSON wrapping.
+  # 1536 leaves headroom for that without truncating mid-JSON.
+  max_tokens: 1536
+  # Per-prompt image-count cap enforced server-side.
+  #   null - server has no known limit. Annotator sends each keyframe
+  #          as its own image_url part — gives the VLM the clearest
+  #          possible signal. Requires the server to actually allow
+  #          multi-image prompts.
+  #   1    - server rejects prompts with > 1 image. The annotator
+  #          stitches keyframes into a single labeled grid image
+  #          before sending. Works with any single-image VLM but the
+  #          signal is lossier (each cell is small).
+  #
+  # IMPORTANT for vLLM: vLLM defaults to image=1 even for multi-image
+  # models like Qwen2.5-VL. To use `null` here you MUST start vLLM
+  # with `--limit-mm-per-prompt image=N` (N >= video.max_keyframes).
+  # If you see HTTP 400 "At most 1 image(s) may be provided in one
+  # prompt", either fix the server flag or set this to `1`.
+  max_images_per_call: null
+
+video:
+  # Stride for sending frames to the VLM. `frame_window_size: 1` sends
+  # every frame (very expensive), `30` sends one frame every 30. The
+  # last frame of the episode is always included so the VLM sees how
+  # the attempt ended.
+  frame_window_size: 15
+  # Hard cap on the number of frames per VLM call. If the stride
+  # produces more than this, the frame list is split into multiple
+  # contiguous chunks (each <= max_keyframes); the annotator invokes
+  # the VLM once per chunk and aggregates the per-chunk answers.
+  max_keyframes: 32
+  # How to overlay the per-frame target bbox on the images sent to the
+  # VLM. Drawing on every frame ("all") lets the VLM track which
+  # object is the target throughout the clip — important when there
+  # are multiple similar objects in view.
+  #   "all"   - overlay on every frame (recommended).
+  #   "first" - only on the first frame of each chunk.
+  #   "none"  - never draw the bbox.
+  bbox_overlay: "all"
+  jpeg_quality: 85
+  resize_long_side: 512
+
+prompts:
+  target_description: "the LEGO block highlighted by the green bounding box (the box tracks the target across frames)"
+  system: |
+    You are an annotator for a robot grasping dataset. For each
+    submitted clip you must:
+
+      1. Decide the OUTCOME of the pick attempt.
+      2. Identify the EARLIEST cell where the outcome is visible.
+
+    Each image you receive has a "cell K/N" badge stamped in its
+    top-right corner. K is the 0-based cell index you must use for
+    `terminal_local_keyframe_idx`. N is the total number of cells.
+    READ the badge — do not guess the cell count.
+
+    HARD RULES:
+
+      H1. The terminal is the EARLIEST qualifying cell. Later cells
+          show the gripper retreating with the block already in hand
+          — those are NOT the terminal.
+      H2. The green bounding box marks the TARGET BLOCK. After a
+          successful pick the gripper carries the block AWAY from
+          the bbox rectangle, and the bbox tracker may freeze at the
+          last known location or lose the target. An EMPTY bbox
+          region in later cells is NORMAL during/after a pick and is
+          NOT evidence of failure. Judge by the GRIPPER, not the bbox.
+      H3. If your tag count does not equal N (from the cell badges),
+          you have miscounted — recount BEFORE answering.
+
+    OUTCOME definitions (terminal frame for each):
+
+      * success_correct  : EARLIEST cell where (a) the gripper is
+        closed on the bbox-target AND (b) the target block is
+        visibly OFF the pile (gap between block bottom and surface,
+        OR the block is clearly higher than the rest of the pile).
+      * wrong_object     : EARLIEST cell where a NON-target block is
+        held in the closed gripper and lifted off.
+      * miss_empty_grasp : EARLIEST cell where the closed gripper is
+        retreating AND there is provably no block between the
+        fingers (visible gap, fingers fully touching). Bbox
+        absence is NOT proof.
+      * pile_disturbance : EARLIEST cell where the gripper has moved
+        past the pile without a pick (pile rearranged, no block).
+      * timeout          : last cell, only if none of the above is
+        visible at all.
+      * unclear          : you genuinely cannot tell. Mark the LAST
+        cell and set confidence=0.0.
+
+    BINARY-TAG PROCEDURE (do this BEFORE writing the JSON):
+
+      Tag every cell with EXACTLY ONE of two tags:
+        "before" — the target block has NOT yet been lifted off the
+                   pile in this cell. Includes approach, contact,
+                   gripper closing, and any cell where the block is
+                   still resting on the surface.
+        "after"  — the target block IS off the pile in this cell.
+                   Includes the lift-off cell and every subsequent
+                   holding/retreat cell.
+
+      The terminal index for `success_correct` is the index of the
+      FIRST "after" cell. There is no other rule. If no cell is
+      tagged "after", the outcome is NOT success_correct.
+
+      For miss_empty_grasp / wrong_object / pile_disturbance the
+      terminal is the EARLIEST cell where the corresponding evidence
+      becomes unambiguous (empty fingers / wrong block held / pile
+      passed-by). Only tag a cell with one of these if you can name
+      a SPECIFIC visual cue in it (e.g. "fingers touching, no block
+      between them" — not just "I don't see a block").
+
+    OUTPUT — one single-line JSON object, no markdown, with keys in
+    this order:
+
+      reasoning : "c0:<tag> c1:<tag> ... cN-1:<tag> -> terminal=<k>"
+                  Tag count MUST equal N from the cell badges. The
+                  arrow conclusion MUST be consistent with the tags
+                  (terminal = first cell flipped to "after", or the
+                  earliest cell with the relevant failure cue).
+      outcome   : one of the allowed strings.
+      terminal_local_keyframe_idx : integer cell index k from above.
+      confidence: float in [0, 1]. 1.0 only if the before→after flip
+                  is sharp and you verified earlier cells. < 0.5 if
+                  you had to guess any tag.
+      notes     : short free-form note (≤ 80 chars).
+
+    If the clip is genuinely indecisive, return outcome="unclear"
+    with confidence=0.0 — a later chunk may have the answer.
+
+  user_template: |
+    The video shows a robot arm performing a pick-and-place attempt.
+    Target: {target_description}.
+
+    Each image has a "cell K/N" badge in its TOP-RIGHT corner. K is
+    the 0-based cell index you must use as `terminal_local_keyframe_idx`,
+    and N is the total cell count. The number of "c<i>:tag" entries in
+    your reasoning MUST equal N — recount before answering if it
+    doesn't.
+
+    A green bounding box is drawn around the target in every cell
+    where the tracker has a lock (it may freeze or disappear in late
+    cells if the gripper occludes the target — this is normal and
+    NOT evidence of grasp failure).
+
+    {chunk_header}
+    Frames are sampled at uniform stride from the original episode.
+
+    A "ROBOT TELEMETRY" block at the END of this message lists, ONE
+    LINE PER CELL, the gripper position (mm, relative to the first
+    cell of the episode, +Z = world up) and gripper width (mm),
+    plus the action taken between this cell and the next: dpos,
+    drot_deg, dgripper. Use it as a non-visual cross-check —
+    a NEGATIVE dgripper alongside a POSITIVE dz is the canonical
+    "closing on the block AND lifting" signature, even when the
+    gripper occludes the target in the image.
+
+    Allowed outcome strings (use exactly one):
+      - success_correct  : robot grasped and lifted the bbox-selected block.
+      - wrong_object     : robot grasped a different block than the target.
+      - miss_empty_grasp : gripper closed without picking anything up.
+      - pile_disturbance : the pile was disturbed but no clean pick happened.
+      - timeout          : episode ended without any clear outcome.
+      - unclear          : you genuinely cannot tell from the given frames.
+
+    For `success_correct` use the binary-tag procedure from the
+    system prompt: tag every cell "before" or "after", then
+    terminal = first "after" cell. Do NOT pick the moment of first
+    contact, and do NOT pick a late "holding" cell when an earlier
+    cell already showed lift-off.
+
+    OUTPUT FORMAT (this is the only thing the parser will read):
+
+      * Output ONE JSON object on a single line.
+      * NO markdown fences, NO prose before or after the JSON.
+      * Put your reasoning INSIDE the JSON's "reasoning" field as a
+        plain string — do not write reasoning outside the JSON.
+      * Keys (in order): reasoning, outcome,
+        terminal_local_keyframe_idx, confidence, notes.
+
+    EXAMPLES BELOW USE PLACEHOLDER TAGS. The number of cells and
+    the index of the before→after flip vary by episode — do NOT
+    copy these values. Different clips terminate at very different
+    cells. Read the cell badges and tag each cell yourself.
+
+    Example A (early flip at cell 2, N=10):
+    {{"reasoning": "c0:before c1:before c2:after c3:after c4:after c5:after c6:after c7:after c8:after c9:after -> terminal=2", "outcome": "success_correct", "terminal_local_keyframe_idx": 2, "confidence": 0.95, "notes": "block clearly off pile from cell 2"}}
+
+    Example B (mid flip at cell 5, N=13):
+    {{"reasoning": "c0:before c1:before c2:before c3:before c4:before c5:after c6:after c7:after c8:after c9:after c10:after c11:after c12:after -> terminal=5", "outcome": "success_correct", "terminal_local_keyframe_idx": 5, "confidence": 0.9, "notes": "lift visible from cell 5"}}
+
+    Example C (mid flip at cell 4, N=12, brief gripper occlusion ok):
+    {{"reasoning": "c0:before c1:before c2:before c3:before c4:after c5:after c6:after c7:after c8:after c9:after c10:after c11:after -> terminal=4", "outcome": "success_correct", "terminal_local_keyframe_idx": 4, "confidence": 0.85, "notes": "bbox occluded after cell 4, block above pile"}}
+
+    Example D (no flip — empty grasp at cell 5, N=11):
+    {{"reasoning": "c0:before c1:before c2:before c3:before c4:before c5:before c6:before c7:before c8:before c9:before c10:before -> terminal=5 (no after; fingers visibly empty in cell 5)", "outcome": "miss_empty_grasp", "terminal_local_keyframe_idx": 5, "confidence": 0.8, "notes": "fingers closed empty cell 5"}}
+
+    Example E (wrong object at cell 6, N=11):
+    {{"reasoning": "c0:before c1:before c2:before c3:before c4:before c5:before c6:after c7:after c8:after c9:after c10:after -> terminal=6 (lifted block is NOT the bbox target)", "outcome": "wrong_object", "terminal_local_keyframe_idx": 6, "confidence": 0.78, "notes": "non-target lifted at cell 6"}}
+
+    Now read the cell badges in YOUR clip's images, tag each cell
+    "before" or "after", and produce the JSON. The tag count MUST
+    equal the N in the badges:
+
+reward_map:
+  success_correct: 1.0
+  wrong_object: -1.0
+  miss_empty_grasp: -0.2
+  pile_disturbance: -0.2
+  timeout: 0.0
+  unclear: 0.0
+
+# Defaults for `scripts/annotate_rewards_vlm.py`. Each is overridable via
+# `--in`, `--out`, `--config`, etc. on the CLI.
+io:
+  source_zarr: null   # set on the CLI; e.g. data/datasets/pick_single_lego_486-...zarr.zip
+  output_zarr: null   # if null, the script writes to `<source_zarr>` with a `-rl` tag (e.g. `foo.zarr.zip` -> `foo-rl.zarr.zip`)
+  episode_subset: null  # optional list of episode ids to annotate (debug/smoke-test)
+  resume: true
+  rgb_key: camera0_rgb
+  bbox_key: bbox
+  # Robot proprio + action signal injected into the user prompt as text
+  # alongside the images (see "ROBOT TELEMETRY" block in the prompt).
+  # Per cell the VLM sees: eef position relative to the FIRST cell of
+  # the episode (mm), gripper width (mm), and the action taken (delta
+  # to the next cell): dpos, drot_deg, dgripper. This lets the VLM
+  # confirm visually-occluded picks: a NEGATIVE dgripper paired with a
+  # POSITIVE dz is an unambiguous "closing on the block + lifting"
+  # signature even when the gripper occludes the target.
+  include_proprio_action: true
+  eef_pos_key: robot0_eef_pos
+  eef_rot_key: robot0_eef_rot_axis_angle
+  gripper_key: robot0_gripper_width
+  # On a VLM call / JSON-parse failure:
+  #   false (default) - abort the run and re-raise the underlying error.
+  #                     Strict mode: prevents silently filling rl/ with
+  #                     bogus UNCLEAR labels when the server is broken.
+  #   true            - log the error, treat the failed chunk as a
+  #                     non-vote, and only mark the episode as UNCLEAR
+  #                     if every chunk fails. Useful when the VLM is
+  #                     flaky and you'd rather skip a few episodes than
+  #                     restart.
+  unclear_on_failure: false

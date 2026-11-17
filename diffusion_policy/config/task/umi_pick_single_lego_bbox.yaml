@@ -1,0 +1,135 @@
+name: umi_pick_lego
+
+camera_obs_latency: 0.125
+robot_obs_latency: 0.0001
+gripper_obs_latency: 0.02
+dataset_frequeny: 0 #59.94
+obs_down_sample_steps: 3 # 3, 1
+
+low_dim_obs_horizon: 2
+img_obs_horizon: 1
+action_horizon: 16
+ignore_proprioception: False
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    camera0_rgb:
+      shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # int
+      type: rgb
+      ignore_by_policy: False
+    robot0_eef_pos:
+      shape: [3]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    # robot0_eef_pos_abs:
+    #   shape: [1]
+    #   axis: [2] # 2 means z-axis
+    #   horizon: ${task.low_dim_obs_horizon} # int
+    #   latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+    #   down_sample_steps: ${task.obs_down_sample_steps} # float
+    #   type: low_dim
+    # robot0_eef_rot_axis_angle_abs:
+    #   shape: [2]
+    #   axis: [0, 1] # yaw and pitch
+    #   horizon: ${task.low_dim_obs_horizon} # int
+    #   latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+    #   down_sample_steps: ${task.obs_down_sample_steps} # float
+    #   type: low_dim
+    robot0_eef_rot_axis_angle:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      rotation_rep: rotation_6d
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_gripper_width:
+      shape: [1]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.gripper_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    # Per-frame target bbox in image coordinates: [x0, y0, x1, y1].
+    # Bbox shares the camera's clock, so latency_steps stays at 0.
+    # Key name must match the zarr array name written by the replay-buffer
+    # generation pipeline (currently `bbox`).
+    #
+    # `bbox_mode` selects how the bbox enters the policy. The value is read
+    # by TimmObsEncoder (and UmiDataset's normalizer) and persisted in the
+    # checkpoint via Hydra; policy_server serves it back through /shape_meta
+    # so eval_real automatically knows which path the model was trained on.
+    #
+    #   low_dim:      legacy. The 4 bbox scalars are normalized to [-1, 1]
+    #                 and concatenated to the obs-encoder feature vector
+    #                 alongside the ViT CLS token. Recommended horizon: 2.
+    #   mask_channel: bbox is rasterized to a 1xHxW binary mask, concatenated
+    #                 with `target_rgb_key` to form a 4-channel image, and
+    #                 fed to the ViT after expanding its patch_embed conv
+    #                 from 3 to 4 input channels (the 4th input slice is
+    #                 zero-initialized at training start). The bbox does
+    #                 NOT also flow through the low-dim concat path in this
+    #                 mode. Recommended horizon: 1 (one mask per image).
+    bbox:
+      shape: [4] # [x0, y0, x1, y1] in pixel coords of `target_rgb_key`
+      horizon: 1 # mask_channel: 1 per image; low_dim: ${task.low_dim_obs_horizon}
+      latency_steps: 0 # float perfectly synched with the camera
+      down_sample_steps: ${task.obs_down_sample_steps} # same as the camera
+      type: low_dim
+      ignore_by_policy: False
+      bbox_mode: mask_channel  # one of: low_dim, mask_channel
+      target_rgb_key: camera0_rgb  # only used when bbox_mode == mask_channel
+
+    # pose with respect to episode start
+    # robot0_eef_pos_wrt_start:
+    #   shape: [3]
+    #   horizon: ${task.low_dim_obs_horizon} # int
+    #   latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+    #   down_sample_steps: ${task.obs_down_sample_steps} # float
+    #   type: low_dim
+    #   ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle_wrt_start:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+  action: 
+    shape: [10]
+    horizon: ${task.action_horizon}
+    latency_steps: 0 # float
+    down_sample_steps: ${task.obs_down_sample_steps} # int
+    rotation_rep: rotation_6d
+
+task_name: &task_name umi
+# this will be overridden at call time
+dataset_path: example_demo_session/dataset.zarr.zip
+pose_repr: &pose_repr
+  obs_pose_repr: relative # abs or rel
+  action_pose_repr: relative # abs or rel or delta
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.umi_dataset.UmiDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  cache_dir: null
+  pose_repr: *pose_repr
+  action_padding: False
+  temporally_independent_normalization: False
+  repeat_frame_prob: 0.0
+  max_duration: null
+  seed: 42
+  val_ratio: 0.05

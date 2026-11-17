@@ -1,0 +1,212 @@
+# `_self_` is listed LAST so the IQL workspace can override the task's
+# default `task.dataset` block (which targets `UmiDataset`) with the
+# IQL-aware `UmiIqlDataset`. Everything else (shape_meta, dataset_path,
+# pose_repr, env_runner) is inherited from the task config unchanged.
+defaults:
+  - task: umi_pick_single_lego_bbox
+  - _self_
+
+name: train_iql_umi
+_target_: diffusion_policy.workspace.train_iql_workspace.TrainIqlWorkspace
+
+shape_meta: ${task.shape_meta}
+exp_name: "iql_default"
+batch_size: 64
+visual_encoder: "vit_large_patch14_clip_224"
+visual_encoder_tag: "vitl"
+model_type: "iql"
+num_gpus: 1
+
+# Parsed from the dataset file name's hyphen-separated tokens.
+# eg: pick_lego-black_mirror-real_200-sim_200-no_bbox.zarr.zip
+# Resolver: train.py::parse_dataset_field. Last arg is the fallback default.
+# mirror options: black_mirror, mirror, swap_mirror, no_mirror
+mirror: ${parse_dataset_field:${task.dataset_path},mirror,no_mirror}
+# real_data_size / sim_data_size are null when the filename has no real_<N>/sim_<N>
+# token; the wandb tags below skip themselves in that case.
+real_data_size: ${parse_dataset_field:${task.dataset_path},real_data_size,null}
+sim_data_size: ${parse_dataset_field:${task.dataset_path},sim_data_size,null}
+bbox: ${parse_dataset_field:${task.dataset_path},bbox,no_bbox}
+# Surfaces the bbox integration mode (low_dim vs mask_channel) onto the
+# wandb tag set so runs are filterable by it. Sourced from the task
+# shape_meta so it tracks the actual model wiring, not a separate flag.
+bbox_mode: ${task.shape_meta.obs.bbox.bbox_mode}
+task_name: ${parse_dataset_field:${task.dataset_path},data_task,pick_lego}
+
+
+# Override at run time:
+#   task.dataset_path=path/to/<dataset>-rl.zarr.zip
+# (must be the cloned dataset that contains the `rl/` group; the IQL
+# dataset will refuse to load a source zarr without annotations.)
+
+# IQL-specific hyperparameters. All values are ones the user can edit
+# from the YAML; the workspace reads them from `cfg.iql`.
+iql:
+  gamma: 0.99
+  expectile_tau: 0.7        # IQL expectile (~0.7-0.9 typical)
+  polyak_tau: 0.005         # target Q soft-update rate
+  state_embed_dim: 512
+  action_embed_dim: 256
+  freeze_visual: true       # frozen TimmObsEncoder; toggle off for full FT
+  encoder_lr_scale: 0.1     # LR multiplier on the encoder (vs the heads)
+  # Optional: warm-start the TimmObsEncoder from a diffusion-policy ckpt.
+  # The ckpt must come from a TimmObsEncoder-based diffusion workspace
+  # with a matching encoder config (model_name, transforms, etc). Strict
+  # state_dict loading; mismatches raise. Default `null` because the
+  # canonical path differs by environment: locally it lives under
+  # `/mnt/umi-data/outputs/...`, on Modal under `/data/outputs/...`.
+  # Override on the CLI with
+  #   iql.pretrained_obs_encoder_ckpt=/path/to/diffusion.ckpt
+  pretrained_obs_encoder_ckpt: /data/outputs/2026.05.21_19.11.52/checkpoints/pick_lego_pile-unet-vit_large_patch14_clip_224-batch=512-pick_lego_pile-no_mirror-real_368-bbox-mirrored_x-epoch=0170-train_loss=0.011.ckpt
+
+  # Bucketed critic diagnostics, run after the regular val pass. Logs
+  # V / Q / A / TD-error grouped by episode outcome (success / miss /
+  # wrong_object / unclear) and by episode phase (start / early / mid /
+  # near_terminal / terminal) under `critic_diag/...`, plus a small set
+  # of ordering checks under `critic_diag/ordering/...`. Watch
+  # `critic_diag/ordering/score` over training: it should creep upward
+  # toward 1.0 as the critic learns to rank outcomes correctly.
+  diagnostics:
+    every_n_epochs: 1         # 0 disables; >1 runs less often than val.
+    batch_size: null          # null -> reuse val_dataloader.batch_size.
+    num_workers: 4
+    max_batches: null         # null -> iterate the full val split.
+
+# IQL critic. Reuses the same TimmObsEncoder block as the diffusion
+# policy so the state representation is byte-identical at init when
+# bootstrapping from a diffusion-policy obs encoder.
+policy:
+  _target_: diffusion_policy.policy.iql_critic.IQLCritic
+  shape_meta: ${shape_meta}
+
+  state_embed_dim: ${iql.state_embed_dim}
+  action_embed_dim: ${iql.action_embed_dim}
+  freeze_visual: ${iql.freeze_visual}
+  v_hidden_dims: [512, 512]
+  q_hidden_dims: [512, 512]
+  action_hidden_dims: [256, 256]
+  state_hidden_dims: [512]
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: ${visual_encoder}
+    pretrained: True
+    frozen: ${iql.freeze_visual}
+    global_pool: ''
+    feature_aggregation: 'attention_pool_2d'
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+# Dataset: IQL-aware view of the cloned `<dataset>-rl.zarr.zip`.
+task:
+  dataset:
+    _target_: diffusion_policy.dataset.umi_iql_dataset.UmiIqlDataset
+    shape_meta: ${shape_meta}
+    dataset_path: ${task.dataset_path}
+    cache_dir: null
+    pose_repr: ${task.pose_repr}
+    action_padding: False
+    temporally_independent_normalization: False
+    repeat_frame_prob: 0.0
+    seed: 42
+    val_ratio: 0.10
+    transition: full_chunk     # one of: chunk_step, full_chunk
+
+dataloader:
+  batch_size: ${batch_size}
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 4
+
+val_dataloader:
+  batch_size: ${batch_size}
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-4
+  # lr: 4.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  num_epochs: 30
+  gradient_accumulate_every: 1
+  val_every: 1
+  checkpoint_every: 10
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: umi_iql
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags:
+    - "${name}"
+    - "${task_name}"
+    - "${exp_name}"
+    - "${visual_encoder_tag}"
+    # batch size for each gpu
+    - "batch_size:${eval:'${batch_size} * ${num_gpus}'}"
+    - "num_gpus:${num_gpus}"
+    - "${eval:'\"${task.dataset_path}\".split(\"/\")[-1].rsplit(\".\",1)[0]'}"
+    - "${mirror}"
+    - "iql"
+    - "transition:${task.dataset.transition}"
+    - "freeze_visual:${iql.freeze_visual}"
+    - "${eval:'\"real_size:%d\" % ${real_data_size} if ${real_data_size} is not None else \"\"'}"
+    - "${eval:'\"sim_size:%d\" % ${sim_data_size} if ${sim_data_size} is not None else \"\"'}"
+    - "${eval:'(\"real\" if ${real_data_size} > 0 else \"no_real\") if ${real_data_size} is not None else \"\"'}"
+    - "${eval:'(\"sim\" if ${sim_data_size} > 0 else \"no_sim\") if ${sim_data_size} is not None else \"\"'}"
+    
+  id: null
+  group: ${task_name}_${model_type}
+
+checkpoint:
+  topk:
+    monitor_key: val_advantage_std
+    mode: max
+    k: 10
+    format_str: '{task_name}-{model_type}-{visual_encoder}-batch_{total_batch}-{dataset_file_name}-epoch_{epoch:04d}-val_adv_std_{val_advantage_std:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

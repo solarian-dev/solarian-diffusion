@@ -1,0 +1,324 @@
+# =============================================================================
+# BC-anchored AWR finetune of the BC pick_lego_pile_bbox diffusion policy.
+#
+# Recipe (per the "stronger BC anchoring" RL experiment notes): combine
+# the standard advantage-weighted denoising loss with TWO anchor terms
+# back toward the BC checkpoint so the policy doesn't drift off the
+# imitation manifold and produce the twitchy / unstable motions we saw
+# from the previous unconstrained AWR run:
+#
+#   total_loss =      AWR_term                                # main reward signal
+#               +  bc_lambda  * unweighted_BC_denoising_loss  # "treat every demo equally"
+#               +  anc_lambda * mse(eps_new, eps_frozen_bc)   # soft-KL anchor in eps space
+#
+# The frozen reference U-Net is a deep copy of the BC ckpt's U-Net,
+# snapshotted by the workspace right after `init_from_ckpt` loads
+# (see ``init_frozen_ref()`` on DiffusionUnetTimmPolicy). The anchor
+# term is silently disabled if ``awr_anchor_lambda <= 0`` so legacy
+# AWR runs cost nothing extra in GPU memory.
+#
+# This config is a *finetuning* run: it expects to be initialized from a
+# trained BC checkpoint (`training.init_from_ckpt`) and to be pointed at a
+# zarr.zip that already has `rl/q` and `rl/v` written by `zarr_q_v.py`. The
+# UmiDataset auto-detects those arrays and emits per-sample `advantage` /
+# `has_advantage` keys; DiffusionUnetTimmPolicy reads them only when
+# `policy.awr_beta > 0`.
+#
+# Knobs grouped by what to tune in what order:
+#
+#   1) BASELINE SAFETY KNOBS (already set sensibly here):
+#        training.freeze_encoder = true
+#        training.init_from_ckpt = <BC ckpt>
+#        optimizer.lr            = 1.0e-5        (RL paper recipe: 1e-5..5e-5)
+#        training.num_epochs     = 10
+#        ema.update_after_step   = 0
+#
+#   2) AWR-SHAPE KNOBS (start with the conservative defaults below; only
+#      relax once stable rollouts are confirmed):
+#        policy.awr_beta              = 5.0      (high temperature -> mild reweighting)
+#        policy.awr_w_max             = 3.0      (hard cap; tame outliers)
+#        policy.awr_w_min             = 0.5      (don't let any sample go below half BC)
+#        policy.awr_lambda            = 1.0      (full AWR term, but with above clamps)
+#        policy.awr_normalize_weights = true
+#
+#   3) BC-ANCHOR KNOBS (the new "don't drift" levers):
+#        policy.awr_bc_lambda         = 1.0      (unweighted BC, free since no extra forward)
+#        policy.awr_anchor_lambda     = 0.3      (frozen-ref eps-MSE; ~1 extra U-Net fwd/step)
+#
+# Smoke-test recipes:
+#   * Reproduce legacy AWR run byte-identically:
+#        policy.awr_beta=0.15  policy.awr_w_max=20.0  policy.awr_w_min=0.0
+#        policy.awr_bc_lambda=0.0  policy.awr_anchor_lambda=0.0
+#   * Reproduce plain BC byte-identically:
+#        policy.awr_beta=0.0   policy.awr_lambda=1.0
+#        policy.awr_bc_lambda=0.0  policy.awr_anchor_lambda=0.0
+#   * "Sanity-bake" with just the anchor (no AWR signal): set awr_beta=0
+#     and awr_anchor_lambda=0.3 -- val_loss should remain within ~5% of BC.
+#
+# Note: with `_self_` placed AFTER the task default (Hydra 1.1 idiom), any
+# fields set in this file override the task config's values. The BC sibling
+# config (without `_awr` suffix) keeps `_self_` first because it never
+# overrides task fields; we deviate here on purpose.
+# =============================================================================
+
+defaults:
+  - task: umi_pick_single_lego_bbox
+  - _self_
+
+name: train_diffusion_unet_timm_awr
+_target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
+
+shape_meta: ${task.shape_meta}
+exp_name: "awr"
+batch_size: 128
+visual_encoder: "vit_large_patch14_clip_224"
+visual_encoder_tag: "vitl"
+model_type: "unet"
+num_gpus: 1
+
+# Same parse helpers as the BC config so wandb tags resolve identically.
+mirror: ${parse_dataset_field:${task.dataset_path},mirror,no_mirror}
+real_data_size: ${parse_dataset_field:${task.dataset_path},real_data_size,null}
+sim_data_size: ${parse_dataset_field:${task.dataset_path},sim_data_size,null}
+bbox: ${parse_dataset_field:${task.dataset_path},bbox,no_bbox}
+bbox_mode: ${task.shape_meta.obs.bbox.bbox_mode}
+task_name: ${parse_dataset_field:${task.dataset_path},data_task,pick_lego}
+
+n_action_steps: 8
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_timm_policy.DiffusionUnetTimmPolicy
+
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 50
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: ${visual_encoder}
+    pretrained: True
+    # frozen=False keeps the encoder trainable in principle; the actual
+    # freeze for AWR finetuning happens via `training.freeze_encoder`
+    # below, which sets requires_grad_(False) every epoch. Leaving
+    # frozen=False here matches the BC config so the LR multiplier
+    # logic in the workspace keeps working.
+    frozen: False
+
+    global_pool: ''
+    feature_aggregation: 'attention_pool_2d'
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+
+    # AWR runs reweight existing samples; they already have a much
+    # smaller *effective* dataset than BC. Heavy augmentation here
+    # would dilute the high-advantage signal, so we keep ColorJitter
+    # but drop RandomCrop's spatial randomness. Re-enable the crop if
+    # you find the model overfitting (``train_loss`` falling fast
+    # while ``val_loss`` stays flat).
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+  num_inference_steps: 16
+  obs_as_global_cond: True
+  diffusion_step_embed_dim: 128
+  down_dims: [256,512,1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+  input_pertub: 0.1
+  train_diffusion_n_samples: 1
+
+  # ============== AWR knobs (BC-anchored recipe) ==============
+  # Temperature on the advantage. We set it MUCH higher than the
+  # original AWR run (was 0.15) so the per-sample weight distribution
+  # is mild -- preventing the optimizer from over-fitting to the
+  # critic's biggest-advantage outliers. With the conservative
+  # awr_w_max=3 cap below, the resulting weights span roughly
+  # [0.5, 3.0] -- a 6x dynamic range instead of the 130x the legacy
+  # config could produce. Drop beta toward 1-2 only after stable
+  # rollouts confirm the critic isn't being exploited.
+  awr_beta: 5.0
+  # Hard upper cap on per-sample weight pre-normalization. Combined
+  # with awr_beta=5 this means the effective weight ratio between the
+  # best- and worst-advantage samples is at most ~6x. The legacy
+  # default of 20 frequently let single outliers dominate a batch.
+  awr_w_max: 3.0
+  # Lower floor on per-sample weight (NEW). 0.5 means every sample
+  # carries at least half the BC weight regardless of advantage, so
+  # low-advantage but on-distribution samples can't be silently
+  # zeroed by a very low (or negative) `adv / beta`. Set to 0.0 to
+  # disable for legacy-AWR-equivalent behavior.
+  awr_w_min: 0.5
+  # 1.0 = pure AWR. Set to 0.5 (or lower) as a "safety belt": the loss
+  # becomes a 50/50 average of plain BC and AWR-weighted BC, which
+  # bounds the policy drift if the critic turns out to be miscalibrated.
+  # 0.0 = pure BC (smoke-test mode -- should reproduce the legacy run).
+  awr_lambda: 1.0
+  # Per-batch w / w.mean() normalization. Strongly recommended: keeps
+  # the effective LR invariant to beta and to which subset of the
+  # batch happens to have high advantage.
+  awr_normalize_weights: true
+  # ===== BC anchor terms (NEW) =====
+  # Coefficient on the UNWEIGHTED denoising loss (plain BC). Cheap:
+  # uses the same per-sample MSE the AWR term already computed, no
+  # extra forward pass. 0.0 disables; 1.0 means the total loss is
+  # `AWR + BC` so the policy is pulled back toward "imitate every
+  # demo equally" with equal weight to the advantage signal.
+  awr_bc_lambda: 1.0
+  # Coefficient on the frozen-reference anchor (epsilon-space MSE
+  # against the BC ckpt's U-Net forward at the SAME noisy_trajectory
+  # / timesteps / global_cond). Acts as a soft KL toward the BC
+  # policy in epsilon-space. Costs ONE extra U-Net forward per step
+  # (no backward, ref is frozen). Set to 0.0 to skip the anchor and
+  # save ~600MB of GPU memory.
+  awr_anchor_lambda: 0.3
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: ${batch_size}
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 4
+
+val_dataloader:
+  batch_size: ${batch_size}
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  # 1e-5 -- the RL-fine-tune recipe's recommended range is 1e-5..5e-5
+  # for BC-anchored AWR. The legacy AWR config used 1e-6 because it
+  # had NO anchor and was therefore extremely sensitive to drift;
+  # with the bc_lambda + anchor_lambda terms above bounding policy
+  # drift, we can move ~10x faster without destabilizing rollouts.
+  lr: 1.0e-5
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  # Cosine + 100-step warmup. The schedule is short (10 epochs) so
+  # warmup needs to be too -- a long warmup would never reach the
+  # peak LR before training ends.
+  lr_warmup_steps: 100
+  # Short on purpose. AWR re-weights an existing dataset; once the
+  # high-advantage samples are absorbed there's little to learn and
+  # over-training degrades visual generalization. Bump to 30 if you
+  # see val_loss / action_mse still trending down at epoch 10.
+  num_epochs: 10
+  gradient_accumulate_every: 1
+  use_ema: True
+  # Freeze the visual encoder for AWR. The features that worked for
+  # BC are the same features the IQL critic was trained against; if
+  # we let them drift, the critic's Q estimate becomes uncalibrated
+  # and the AWR weights point in the wrong direction.
+  freeze_encoder: True
+
+  # Path to the BC checkpoint to initialize from. SET THIS BEFORE
+  # RUNNING. Optimizer state, global_step, and epoch counters are
+  # NOT loaded -- the run starts from step 0 with a fresh AdamW.
+  # Override on CLI: training.init_from_ckpt=/path/to/bc.ckpt
+  init_from_ckpt: null
+
+  rollout_every: 10
+  checkpoint_every: 1
+  val_every: 1
+  sample_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: umi
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags:
+    - "${name}"
+    - "${task_name}"
+    - "${exp_name}"
+    - "awr"
+    - "${visual_encoder_tag}"
+    - "batch_size:${eval:'${batch_size} * ${num_gpus}'}"
+    - "num_gpus:${num_gpus}"
+    - "${model_type}"
+    - "${eval:'\"${task.dataset_path}\".split(\"/\")[-1].rsplit(\".\",1)[0]'}"
+    - "${mirror}"
+    - "${eval:'\"real_size:%d\" % ${real_data_size} if ${real_data_size} is not None else \"\"'}"
+    - "${eval:'\"sim_size:%d\" % ${sim_data_size} if ${sim_data_size} is not None else \"\"'}"
+    - "${eval:'(\"real\" if ${real_data_size} > 0 else \"no_real\") if ${real_data_size} is not None else \"\"'}"
+    - "${eval:'(\"sim\" if ${sim_data_size} > 0 else \"no_sim\") if ${sim_data_size} is not None else \"\"'}"
+    - "${bbox}"
+    - "bbox_mode:${bbox_mode}"
+    - "awr_beta:${policy.awr_beta}"
+    - "awr_lambda:${policy.awr_lambda}"
+    - "awr_w_min:${policy.awr_w_min}"
+    - "awr_w_max:${policy.awr_w_max}"
+    - "awr_bc_lambda:${policy.awr_bc_lambda}"
+    - "awr_anchor_lambda:${policy.awr_anchor_lambda}"
+  id: null
+  group: ${task_name}_${model_type}_awr
+
+checkpoint:
+  topk:
+    # Track val_loss instead of train_loss for AWR finetuning.
+    # train_loss is dominated by the AWR weight magnitude and is
+    # NOT comparable across awr_beta values; val_loss is plain
+    # unweighted MSE so it's the right thing to rank ckpts on.
+    monitor_key: val_loss
+    mode: min
+    k: 10
+    format_str: '{task_name}-awr-{model_type}-{visual_encoder}-batch_{total_batch}-{dataset_file_name}-epoch_{epoch:04d}-val_loss_{val_loss:.4f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

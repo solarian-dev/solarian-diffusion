@@ -1,0 +1,79 @@
+[project]
+name = "solarian-diffusion"
+version = "0.1.0"
+description = "Diffusion (UMI) policy plugin for Solarian: trains and serves a DiffusionUnetTimmPolicy"
+authors = [
+    {name = "Raul Garreta", email = "raul@solarian.dev"}
+]
+readme = "README.md"
+license = {text = "Apache-2.0"}
+classifiers = ["License :: OSI Approved :: Apache Software License"]
+requires-python = ">=3.10"
+dependencies = [
+    "solarian>=0.5.0",
+]
+
+# The UMI model + training code (the `diffusion_policy` package and the small
+# `umi.common.pose_util` helper) is vendored directly into this plugin, so no
+# external UMI install is required. Heavy ML runtimes stay optional extras so
+# that merely *discovering* the trainer/server (e.g. on a robot controller)
+# doesn't pull in PyTorch.
+#
+# NOTE: hydra-core, omegaconf, dill, numpy, scipy, pandas, tqdm and the HTTP
+# serving stack (fastapi/uvicorn/requests) all ship with solarian core, so they
+# are intentionally not repeated below.
+[project.optional-dependencies]
+# Serve a trained checkpoint over HTTP.
+serve = [
+    "torch",
+    "torchvision",
+    "diffusers",
+    "timm",
+    "einops",
+    "zarr",
+    "numcodecs",
+    "imagecodecs",
+    "numba",
+]
+# Train a new policy (adds the accelerate multi-GPU loop + wandb logging).
+train = [
+    "torch",
+    "torchvision",
+    "diffusers",
+    "timm",
+    "einops",
+    "zarr",
+    "numcodecs",
+    "imagecodecs",
+    "numba",
+    "accelerate",
+    "wandb",
+]
+# Cloud training via Modal: solarian modal-train.
+modal = [
+    "solarian-modal",
+]
+
+# Discoverable by `solarian train` via the solarian.trainers entry-point group.
+[project.entry-points."solarian.trainers"]
+diffusion = "solarian_diffusion.trainer:DiffusionTrainer"
+
+# Served with `solarian run-service diffusion-policy --checkpoint <ckpt>`.
+[project.entry-points."solarian.services"]
+diffusion-policy = "solarian_diffusion.service:DiffusionPolicyService"
+
+# Convenience launcher for the policy server.
+[project.scripts]
+solarian-diffusion-policy = "solarian_diffusion.policy_server:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# Ship the plugin code plus the vendored `diffusion_policy` / `umi` packages.
+[tool.setuptools.packages.find]
+include = ["solarian_diffusion*", "diffusion_policy*", "umi*"]
+
+# The UMI Hydra configs are read from disk at train time, so bundle the YAMLs.
+[tool.setuptools.package-data]
+diffusion_policy = ["config/**/*.yaml", "config/**/*.yml"]

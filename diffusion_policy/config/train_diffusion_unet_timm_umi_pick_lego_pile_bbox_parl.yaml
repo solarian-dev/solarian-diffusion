@@ -1,0 +1,399 @@
+# =============================================================================
+# PA-RL fine-tune of the BC pick_lego_pile_bbox diffusion policy.
+#
+# Implements offline Policy-Agnostic RL (Sobol Mark et al., 2024,
+# "Policy Agnostic RL", arXiv:2412.06685) on top of an existing BC
+# diffusion policy and a frozen offline IQL critic. The recipe is
+# the "hybrid relabel" variant agreed in the plan:
+#
+#   * Bootstrap relabel from the BC ckpt's EMA at epoch 0.
+#   * Re-relabel every `parl.relabel_every` epochs from the current
+#     EMA snapshot.
+#   * Each relabel pass: sample K chunks per state from the EMA
+#     proposer, rerank by min(Q1, Q2), keep top-m, run T steps of
+#     gradient ascent on Q with the revert-on-no-improve rule
+#     (Algorithm 1), then pick (argmax-Q by default).
+#   * Train the diffusion model with the standard DDPM eps loss
+#     against those optimized actions (Eq. 4.5 in the paper). NO
+#     reparameterized policy gradient through the denoising chain.
+#
+# AWR knobs are mutually exclusive with PA-RL: when the dataloader
+# emits action_optimized, the policy.compute_loss path forces
+# awr_active=False even if awr_beta > 0. We still ship awr_beta=0
+# explicitly so the AWR branch is a no-op even on a stale ckpt that
+# learned non-zero beta. The eps-anchor toward the BC ckpt
+# (`awr_anchor_lambda`) is OPTIONAL and disabled by default; turn it
+# on if rollouts drift twitchy as you've seen with prior AWR runs.
+#
+# Required CLI overrides:
+#
+#   training.init_from_ckpt=<BC ckpt>
+#   training.q_critic_ckpt=<IQL ckpt>
+#
+# Smoke-test recipes (all override on top of this file):
+#   * Filtered/iterated BC sanity baseline (degenerate PA-RL):
+#         parl.k_samples=1 parl.T_grad_steps=0 parl.include_dataset_action=true
+#     (single candidate per state == dataset action; no Q optimization;
+#     trains the policy to imitate exactly the dataset actions every
+#     epoch. Should reproduce plain BC up to the EMA divergence.)
+#   * PA-RL global-only (matches the IDQL-style ablation in Table 4):
+#         parl.T_grad_steps=0
+#   * PA-RL local-only:
+#         parl.k_samples=1 parl.include_dataset_action=false parl.T_grad_steps=10
+#   * PA-RL with BC anchor safety net (defensive against drift):
+#         policy.awr_anchor_lambda=0.3
+#
+# Cost note: each relabel pass at K=32, m=10, T=10, DDIM=5 over
+# ~100k frames finishes in a few minutes on a single A6000-class GPU.
+# Relabel cache size: ~64 MB at H=16, A=10, fp32, N=100k frames.
+# =============================================================================
+
+defaults:
+  - task: umi_pick_single_lego_bbox
+  - _self_
+
+name: train_diffusion_unet_timm_parl
+_target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
+
+shape_meta: ${task.shape_meta}
+exp_name: "parl"
+batch_size: 128
+visual_encoder: "vit_large_patch14_clip_224"
+visual_encoder_tag: "vitl"
+model_type: "unet"
+num_gpus: 1
+
+mirror: ${parse_dataset_field:${task.dataset_path},mirror,no_mirror}
+real_data_size: ${parse_dataset_field:${task.dataset_path},real_data_size,null}
+sim_data_size: ${parse_dataset_field:${task.dataset_path},sim_data_size,null}
+bbox: ${parse_dataset_field:${task.dataset_path},bbox,no_bbox}
+bbox_mode: ${task.shape_meta.obs.bbox.bbox_mode}
+task_name: ${parse_dataset_field:${task.dataset_path},data_task,pick_lego}
+
+n_action_steps: 8
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_timm_policy.DiffusionUnetTimmPolicy
+
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 50
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: ${visual_encoder}
+    pretrained: True
+    # Match the AWR config: encoder is trainable in principle but
+    # frozen at runtime via `training.freeze_encoder=true` so the
+    # IQL critic's state distribution stays the one it was calibrated
+    # against -- otherwise `Q(s, a)` becomes noisy as the encoder
+    # drifts and the relabel pass starts producing garbage targets.
+    frozen: False
+
+    global_pool: ''
+    feature_aggregation: 'attention_pool_2d'
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+
+    # Lighter augmentations than BC for the same reason as AWR: PA-RL
+    # is a refinement of an existing policy, and aggressive crops
+    # would feed encoder-distorted obs into the relabel critic.
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+  num_inference_steps: 16
+  obs_as_global_cond: True
+  diffusion_step_embed_dim: 128
+  down_dims: [256,512,1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+  input_pertub: 0.1
+  train_diffusion_n_samples: 1
+
+  # ============== AWR knobs: all OFF for PA-RL ==============
+  # The PA-RL path replaces AWR entirely: when the batch carries an
+  # ``action_optimized`` chunk, ``compute_loss`` swaps the DDPM target
+  # to it and force-disables AWR weighting (advantage / has_advantage
+  # are forced to None). These zeros are belt-and-suspenders so the
+  # AWR branch can't fire even if a future change inadvertently leaks
+  # the awr keys.
+  awr_beta: 0.0
+  awr_w_max: 1.0
+  awr_w_min: 0.0
+  awr_lambda: 0.0
+  awr_normalize_weights: false
+  awr_bc_lambda: 0.0
+  # Optional eps-space anchor toward the frozen BC ckpt -- disabled
+  # by default since PA-RL's distillation target is itself derived
+  # from the BC policy via Q-optimization (so it stays close to the
+  # BC manifold by construction). Set to 0.3 if rollouts drift.
+  awr_anchor_lambda: 0.5
+
+# ============== PA-RL block (consumed by the workspace) ==============
+parl:
+  enabled: true
+
+  # Epochs between relabel passes. 1 = relabel every epoch (closest
+  # to the per-batch on-policy ideal in the paper). Bump to 2-3 if
+  # the relabel wall-clock dominates training time.
+  relabel_every: 1
+
+  # Action-optimization knobs from the paper (Sec 4.1, B.1):
+  #   k=32 candidates per state, top m=10, T=10 grad steps, alpha=3e-4.
+  # The paper notes "larger action spaces (such as bimanual
+  # manipulation) might require larger gradient step sizes"; UMI's
+  # 10-D-per-step is medium-sized so the default alpha is fine.
+  k_samples: 32
+  m_top: 10
+  # T_grad_steps: 10
+  T_grad_steps: 2
+  alpha_grad: 3.0e-4
+
+  # Pick: argmax_Q over the optimized set is the recommended choice
+  # for narrow / multimodal datasets per Sec B.1 ("If the variance
+  # is too small, we find that training only with the argmax performs
+  # better."). Switch to "softmax" to sample from the categorical
+  # over Q values for diversity.
+  distill_mode: argmax
+  softmax_temperature: 1.0
+
+  # Include the DATASET action as an extra candidate before pick
+  # (Sec 4.3 "implementation details"). Cheap; helps when the
+  # dataset action is already near-optimal for that state.
+  include_dataset_action: true
+
+  # EMA snapshot is the "current policy" for proposing candidates.
+  # More stable than the main model (which is mid-optimizer-step) and
+  # is what the rollout / val passes use, so it matches deployment.
+  proposer: ema
+
+  # Cheaper DDIM steps for the relabel pass than at deployment.
+  # Picking 5 here (vs 16 at policy.num_inference_steps) cuts the
+  # diffusion sampler's wall-clock by ~3x with no measurable hit to
+  # candidate quality at K=32 (the rerank picks the best regardless).
+  proposer_inference_steps: 5
+
+  # Per-batch states to process during the relabel pass. With K=32
+  # we expand to (B*K, H, A) for a single batched U-Net forward, so
+  # B=128 means 4096 trajectories per forward -- comfortable on
+  # A100-80GB after the autocast(bf16) + dedup-encoder + state-embed
+  # cache wins. The relabel pass has fixed per-iter overhead (two
+  # GPU<->CPU sync points and the diffusion sampler's Python step
+  # loop) that does NOT scale with B, so larger B amortizes it. On
+  # A100-80GB the smoke run idles at ~8% memory at B=64; raising B
+  # is the cheapest remaining speedup.
+  # Lower (e.g. 32-64) on 24-40GB cards or if you OOM.
+  relabel_batch_size: 128
+  relabel_num_workers: 12
+
+  # When True (default), persist the relabel cache to
+  # `${output_dir}/relabel_cache_epoch{N:04d}.npy` plus a sibling
+  # `_valid` mask. Useful for sanity-checking ("did optimized chunks
+  # actually move?") and for reading from rank > 0 in a future
+  # multi-GPU relabel.
+  save_cache_to_disk: true
+
+  # v2 forward-compat: if False, also train the IQL critic with
+  # optimized-action TD targets per Algorithm 2. Not implemented
+  # in v1 -- leaving this knob in place documents the intent.
+  freeze_critic: true
+
+  # When True (and freeze_critic=true), precompute critic.state_embed
+  # for every dataset frame ONCE after the critic is loaded and reuse
+  # it across all relabel cycles. Eliminates the per-batch IQL ViT-L
+  # forward inside optimize_actions; replaced by an O(B) index_select
+  # from a pinned CPU tensor. Builds in ~3-5 min on A100 for ~170k
+  # frames; saves 25-30% of the per-relabel wall-clock thereafter.
+  # Optional separate batch size / worker count for the build pass
+  # (defaults to the relabel knobs); the build is single-rank and
+  # encoder-bound so larger batches help when GPU memory permits.
+  cache_state_embed: true
+
+  # When True (and training.freeze_encoder=true), precompute the
+  # PROPOSER's obs_encoder output for every dataset frame ONCE and
+  # reuse it across all relabel cycles. Eliminates the second big
+  # ViT-L forward inside ``propose_actions`` (the proposer's encoder
+  # is the same architecture as the critic's). With both caches on,
+  # the per-iter relabel cost has zero ViT-L forwards left -- only
+  # the U-Net's K diffusion samples and tiny MLP heads. Adds a
+  # one-time ~3-5 min build pass with the same precompute_batch_size
+  # as the state_embed cache.
+  # Auto-disabled when training.freeze_encoder=false (the cache
+  # would be invalidated as soon as the encoder updates).
+  cache_global_cond: true
+
+  # The build pass is encoder-only (no U-Net, no local-opt), so it
+  # tolerates a much bigger batch than the relabel pass on the same
+  # card. 256 fits comfortably on A100-80GB; halve on 24-40GB cards.
+  precompute_batch_size: 256
+  precompute_num_workers: 12
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: ${batch_size}
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  # PA-RL rebuilds the dataloader after each relabel pass so workers
+  # spawn fresh and pick up the swapped optimized-action cache. With
+  # persistent_workers=True the OLD workers would still hold a
+  # forked copy of the dataset with stale (or absent) cache, which is
+  # exactly what we don't want.
+  persistent_workers: False
+  prefetch_factor: 4
+
+val_dataloader:
+  batch_size: ${batch_size}
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+  prefetch_factor: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  # 5e-5: paper's distillation LR for kitchen-style narrow data
+  # (Appendix B.1). Up from AWR's 1e-5 because PA-RL's relabel
+  # targets are themselves moving toward the optimum -- the policy
+  # needs to keep up. Drop to 1e-5 if you observe oscillating
+  # val_loss between relabel cycles.
+  lr: 5.0e-5
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  # PA-RL needs more epochs than AWR: each relabel pass only nudges
+  # the policy, and you need several cycles for the policy ->
+  # relabel -> policy loop to converge. Bump to 50 if the val_loss
+  # is still trending down at epoch 30.
+  num_epochs: 30
+  gradient_accumulate_every: 1
+  use_ema: True
+  # Same rationale as AWR: the IQL critic was trained against the
+  # BC encoder's features, so we freeze the encoder during PA-RL
+  # so Q(s, a) values stay calibrated.
+  freeze_encoder: True
+
+  # BC checkpoint to initialize from. SET BEFORE RUNNING.
+  init_from_ckpt: null
+
+  # NEW (PA-RL): IQL critic checkpoint. Same path semantics as
+  # init_from_ckpt: optimizer + step counters are NOT loaded; only
+  # the critic's state_dict goes onto the module. SET BEFORE
+  # RUNNING (override on CLI:
+  #   training.q_critic_ckpt=/path/to/iql.ckpt
+  # ).
+  q_critic_ckpt: null
+
+  rollout_every: 10
+  checkpoint_every: 1
+  val_every: 1
+  sample_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: umi
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags:
+    - "${name}"
+    - "${task_name}"
+    - "${exp_name}"
+    - "parl"
+    - "${visual_encoder_tag}"
+    - "batch_size:${eval:'${batch_size} * ${num_gpus}'}"
+    - "num_gpus:${num_gpus}"
+    - "${model_type}"
+    - "${eval:'\"${task.dataset_path}\".split(\"/\")[-1].rsplit(\".\",1)[0]'}"
+    - "${mirror}"
+    - "${eval:'\"real_size:%d\" % ${real_data_size} if ${real_data_size} is not None else \"\"'}"
+    - "${eval:'\"sim_size:%d\" % ${sim_data_size} if ${sim_data_size} is not None else \"\"'}"
+    - "${eval:'(\"real\" if ${real_data_size} > 0 else \"no_real\") if ${real_data_size} is not None else \"\"'}"
+    - "${eval:'(\"sim\" if ${sim_data_size} > 0 else \"no_sim\") if ${sim_data_size} is not None else \"\"'}"
+    - "${bbox}"
+    - "bbox_mode:${bbox_mode}"
+    - "parl_K:${parl.k_samples}"
+    - "parl_m:${parl.m_top}"
+    - "parl_T:${parl.T_grad_steps}"
+    - "parl_alpha:${parl.alpha_grad}"
+    - "parl_pick:${parl.distill_mode}"
+    - "parl_proposer:${parl.proposer}"
+    - "parl_relabel_every:${parl.relabel_every}"
+    - "parl_include_data_action:${parl.include_dataset_action}"
+    - "parl_anchor_lambda:${policy.awr_anchor_lambda}"
+  id: null
+  group: ${task_name}_${model_type}_parl
+
+checkpoint:
+  topk:
+    # Track val_loss: with PA-RL active, val_loss is the unweighted
+    # DDPM loss against the OPTIMIZED action target (matches train
+    # objective). Lower = better distillation of the Q-optimal chunk.
+    #
+    # NOTE: val_loss alone is unsafe when policy.awr_anchor_lambda
+    # is 0 -- the loss can decrease while the optimized targets
+    # drift away from the demonstration manifold in critic-blind
+    # dims (rotation, gripper width, Z when reward is sparse-
+    # success). The recommended setup pairs this monitor with
+    # policy.awr_anchor_lambda >= 0.3, which architecturally bounds
+    # drift; under that constraint, lower val_loss == better policy.
+    # If you ever turn the anchor off, switch monitor_key to a
+    # drift-aware metric (see the parl/val_action_pos_expert hook
+    # below, gated by training.parl.expert_episode_filter).
+    monitor_key: val_loss
+    mode: min
+    k: 10
+    format_str: '{task_name}-parl-{model_type}-{visual_encoder}-batch_{total_batch}-{dataset_file_name}-epoch_{epoch:04d}-val_loss_{val_loss:.4f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

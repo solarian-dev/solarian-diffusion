@@ -1,0 +1,141 @@
+# Configuration v2: minimal-prompt annotation against Gemini.
+#
+# Differences vs. `rl_annotate.yaml` (v1):
+#   * Calls Gemini 3.5 Flash via the OpenAI compatibility shim
+#     (https://generativelanguage.googleapis.com/v1beta/openai/) instead
+#     of a local vLLM/MiniCPM/Qwen server.
+#   * Single-question prompt — we trust the stronger model and skip the
+#     elaborate per-cell-tag scaffolding from v1.
+#   * Output schema (`{"outcome": <enum>, "cell_number": <int>}`) is
+#     enforced server-side via Gemini's structured-output mode
+#     (constrained decoding). The model can only emit tokens that fit
+#     the schema, so we don't have to coach it via prompt prose:
+#     no "begin with `{`", no "no markdown", no inline JSON examples.
+#   * Health check is skipped because Gemini's `/v1/openai/models`
+#     listing doesn't match the short model name used here.
+#
+# Usage:
+#   export GEMINI_API_KEY=...
+#   python scripts/annotate_rewards_vlm.py \
+#       --in  data/datasets/...zarr.zip \
+#       --config diffusion_policy/config/rl_annotate_v2.yaml \
+#       --episodes 0 1 2 --visualize
+
+vlm:
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  # Resolved from the GEMINI_API_KEY env var via OmegaConf interpolation.
+  # Override with `--config-overrides vlm.api_key=...` or by editing here.
+  api_key: ${oc.env:GEMINI_API_KEY,unset}
+  # Stable Gemini Flash slug (per ai.google.dev/gemini-api/docs/models).
+  model: gemini-3.5-flash
+  temperature: 0.0
+  timeout_s: 120.0
+  # IMPORTANT: Gemini 3.x defaults to `thinking_level: medium`, which
+  # silently consumes thinking tokens out of `max_tokens` BEFORE any
+  # visible output. With ~14 images we observed ~250+ thinking tokens
+  # per call. We pin `reasoning_effort: low` below to keep this under
+  # control, but we still need comfortable headroom for whatever
+  # thinking remains plus the schema-bound JSON output (~30 tokens).
+  max_tokens: 4096
+  # Gemini's mapping of OpenAI's `reasoning_effort` -> `thinking_level`.
+  # Allowed values: "minimal" | "low" | "medium" | "high". For this
+  # task ("when does the gripper lift the block?") a single forward
+  # pass is more than enough — no chain-of-thought needed.
+  reasoning_effort: minimal
+  # Gemini accepts many images per call natively; no client-side grid
+  # composition needed.
+  max_images_per_call: null
+  # Strict structured output via OpenAI's `json_schema` response_format.
+  # Gemini 2.0+ translates this server-side to `responseJsonSchema` and
+  # uses constrained decoding to GUARANTEE the reply matches the schema:
+  # no preamble, no markdown, no missing/extra keys, no invalid enum
+  # values. Because of this, the prompts below can stay terse — the
+  # model is physically prevented from emitting anything else.
+  response_format:
+    type: json_schema
+    json_schema:
+      name: pick_outcome
+      strict: true
+      schema:
+        type: object
+        additionalProperties: false
+        required: [outcome, cell_number]
+        properties:
+          outcome:
+            type: string
+            enum: [success_correct, wrong_object, miss_empty_grasp]
+          cell_number:
+            type: integer
+  # Hosted endpoint: skip the GET /v1/models verification.
+  skip_health_check: true
+
+video:
+  # Stride for sending frames to the VLM. A 200-frame episode at
+  # stride 15 produces ~14 cells, which is plenty for Gemini.
+  frame_window_size: 15
+  # Hard cap on the number of frames per VLM call. Gemini Flash easily
+  # handles 32+ images in one prompt; raise if you want finer
+  # localization without chunking.
+  # max_keyframes: 32
+  max_keyframes: 3200
+  # Overlay the per-frame target bbox so the VLM can distinguish the
+  # target block from other similar objects.
+  bbox_overlay: "all"
+  jpeg_quality: 90
+  # Image resolution sent to the VLM. Higher = more vision tokens (and
+  # higher cost) but better small-detail visibility (gripper-block
+  # contact, lift height). 768 → ~1.4k tokens/image; 512 → ~600/image.
+  resize_long_side: 768
+
+prompts:
+  # The schema does the heavy lifting; the prompt only states what the
+  # task is. No JSON shape coaching, no formatting rules — Gemini's
+  # constrained decoder enforces the response shape directly.
+  target_description: "the LEGO block highlighted by the green bounding box"
+  system: |
+    You are a vision annotator for a robot grasping dataset. Each
+    image you receive is one keyframe of a single task execution,
+    stamped with a "cell K/N" badge in its top-right corner (K is
+    the 0-based cell index, N the total cell count).
+  user_template: |
+    Identify the earliest cell where the target block (A green
+    bounding box marks the target block) is grasped by the gripper and lifted off the surface,
+    using the "cell K/N" badges to determine the cell index.
+    Answer with key "cell_number" with the number of the cell selected.
+    Answer with key "outcome" of the pick attempt: success_correct if the gripper grasped and lifted the bbox-highlighted target block; wrong_object if it grasped a DIFFERENT block; miss_empty_grasp if no block is grasped.
+    If no block is grasped, answer cell_number with the value of the last cell.
+
+    A "ROBOT TELEMETRY" block at the END of this message lists, one
+    line per cell, the gripper position (mm relative to the first cell,
+    +Z = up) and gripper width (mm) plus the action taken to the next
+    cell (dpos, drot_deg, dgripper). A NEGATIVE dgripper paired with
+    a POSITIVE dz at cell K is the canonical "closing on the block
+    AND lifting" signature — use it as a tie-breaker when the visual
+    is occluded.
+reward_map:
+  success_correct: 1.0
+  wrong_object: -1.0
+  miss_empty_grasp: -0.5
+  # pile_disturbance: -0.2
+  # timeout: 0.0
+  # unclear: 0.0
+
+io:
+  source_zarr: null
+  output_zarr: null
+  episode_subset: null
+  resume: true
+  rgb_key: camera0_rgb
+  bbox_key: bbox
+  # See rl_annotate.yaml for an explanation of the telemetry block.
+  # Gemini handles the extra text fine (~50 tokens per cell) and the
+  # action delta is the cleanest signal for "did the gripper close
+  # on the block and lift it" when the camera view is partial.
+  include_proprio_action: true
+  eef_pos_key: robot0_eef_pos
+  eef_rot_key: robot0_eef_rot_axis_angle
+  gripper_key: robot0_gripper_width
+  # Strict-by-default: any Gemini call / parse failure aborts the run
+  # so we don't silently fill rl/ with bogus labels when an API key is
+  # rate-limited / revoked.
+  unclear_on_failure: false
